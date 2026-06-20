@@ -1,0 +1,79 @@
+{
+  "doc_type": "invoice",
+  "fields": [
+    {
+      "name": "invoice_number",
+      "keywords": ["发票号码", "发票号", "No"],
+      "position": "top_right",
+      "value_pattern": "\\d{8,12}",
+      "required": true
+    },
+    {
+      "name": "invoice_code",
+      "keywords": ["发票代码", "代码"],
+      "position": "top_right",
+      "value_pattern": "\\d{10,12}",
+      "required": true
+    },
+    {
+      "name": "amount",
+      "keywords": ["价税合计", "合计金额", "总金额", "金额合计"],
+      "position": "center",
+      "value_pattern": "[\\d,.]+",
+      "required": true
+    },
+    {
+      "name": "amount_without_tax",
+      "keywords": ["不含税金额", "合计", "金额"],
+      "position": "center",
+      "value_pattern": "[\\d,.]+",
+      "required": false
+    },
+    {
+      "name": "tax_amount",
+      "keywords": ["税额", "税"],
+      "position": "center",
+      "value_pattern": "[\\d,.]+",
+      "required": false
+    },
+    {
+      "name": "invoice_date",
+      "keywords": ["开票日期", "日期"],
+      "position": "top_right",
+      "value_pattern": "\\d{4}[年/-]\\d{1,2}[月/-]\\d{1,2}",
+      "required": true
+    },
+    {
+      "name": "seller_name",
+      "keywords": ["销售方", "收款单位", "开票方", "销方名称"],
+      "position": "bottom_left",
+      "value_pattern": ".+",
+      "required": false
+    },
+    {
+      "name": "buyer_name",
+      "keywords": ["购买方", "付款单位", "购方名称"],
+      "position": "top_left",
+      "value_pattern": ".+",
+      "required": false
+    },
+    {
+      "name": "check_code",
+      "keywords": ["校验码", "查验码"],
+      "position": "top_right",
+      "value_pattern": "[A-Za-z0-9]+",
+      "required": false
+    }
+  ],
+  "validation_rules": [
+    {
+      "type": "amount_check",
+      "description": "amount = amount_without_tax + tax_amount",
+      "tolerance": 0.01
+    },
+    {
+      "type": "invoice_code_format",
+      "description": "invoice_code must be 10-12 digits"
+    }
+  ]
+}

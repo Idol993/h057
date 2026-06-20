@@ -1,0 +1,50 @@
+{
+  "doc_type": "bank_card",
+  "fields": [
+    {
+      "name": "card_number",
+      "keywords": ["卡号", "账号", "帐号"],
+      "position": "center",
+      "value_pattern": "\\d{13,19}",
+      "required": true
+    },
+    {
+      "name": "expiry_date",
+      "keywords": ["有效期", "有效期限", "GOOD THRU"],
+      "position": "bottom_right",
+      "value_pattern": "\\d{2}/\\d{2,4}",
+      "required": false
+    },
+    {
+      "name": "cardholder_name",
+      "keywords": ["持卡人", "姓名"],
+      "position": "bottom_left",
+      "value_pattern": ".+",
+      "required": false
+    },
+    {
+      "name": "bank_name",
+      "keywords": ["银行"],
+      "position": "top_center",
+      "value_pattern": "[\\u4e00-\\u9fa5]+银行",
+      "required": false
+    },
+    {
+      "name": "card_type",
+      "keywords": ["信用卡", "储蓄卡", "借记卡", "CREDIT", "DEBIT"],
+      "position": "top_left",
+      "value_pattern": ".+",
+      "required": false
+    }
+  ],
+  "validation_rules": [
+    {
+      "type": "luhn_check",
+      "description": "Luhn algorithm for card number validation"
+    },
+    {
+      "type": "card_number_length",
+      "description": "card number must be 13-19 digits"
+    }
+  ]
+}

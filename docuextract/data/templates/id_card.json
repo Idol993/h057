@@ -1,0 +1,57 @@
+{
+  "doc_type": "id_card",
+  "fields": [
+    {
+      "name": "name",
+      "keywords": ["姓名", "名字"],
+      "position": "top_left",
+      "value_pattern": "[\\u4e00-\\u9fa5]{2,4}",
+      "required": true
+    },
+    {
+      "name": "id_number",
+      "keywords": ["公民身份号码", "身份号码", "身份证号", "身份证号码"],
+      "position": "bottom_center",
+      "value_pattern": "\\d{17}[\\dXx]",
+      "required": true
+    },
+    {
+      "name": "address",
+      "keywords": ["住址", "地址"],
+      "position": "bottom_left",
+      "value_pattern": ".+",
+      "required": false
+    },
+    {
+      "name": "gender",
+      "keywords": ["性别"],
+      "position": "top_left",
+      "value_pattern": "[男女]",
+      "required": false
+    },
+    {
+      "name": "ethnicity",
+      "keywords": ["民族"],
+      "position": "top_left",
+      "value_pattern": "[\\u4e00-\\u9fa5]+",
+      "required": false
+    },
+    {
+      "name": "birth_date",
+      "keywords": ["出生", "出生日期"],
+      "position": "center_left",
+      "value_pattern": "\\d{4}[年/-]\\d{1,2}[月/-]\\d{1,2}",
+      "required": false
+    }
+  ],
+  "validation_rules": [
+    {
+      "type": "id_number_checksum",
+      "description": "GB 11643-1999, ISO 7064:1983 MOD 11-2"
+    },
+    {
+      "type": "id_number_length",
+      "description": "must be 18 characters"
+    }
+  ]
+}
