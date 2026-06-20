@@ -6,15 +6,31 @@ import numpy as np
 from docuextract.config import OCRConfig
 
 
+class OCREngineNotFoundError(RuntimeError):
+    """PaddleOCR engine is not available (not installed or initialization failed)."""
+    pass
+
+
 class TextDetector:
 
-    def __init__(self, config: Optional[OCRConfig] = None):
+    def __init__(self, config: Optional[OCRConfig] = None, strict: bool = True):
         self.config = config or OCRConfig()
         self._ocr_engine = None
+        self._init_failed = False
+        self._init_error: Optional[str] = None
+        self.strict = strict
 
-    def _get_engine(self) -> Any:
+    def _get_engine(self, raise_on_missing: bool = False) -> Any:
         if self._ocr_engine is not None:
             return self._ocr_engine
+
+        if self._init_failed:
+            if raise_on_missing or self.strict:
+                raise OCREngineNotFoundError(
+                    f"PaddleOCR engine initialization failed: {self._init_error}\n"
+                    f"Please install PaddleOCR with: pip install paddleocr paddlepaddle"
+                )
+            return None
 
         try:
             from paddleocr import PaddleOCR
@@ -33,17 +49,27 @@ class TextDetector:
                 drop_score=self.config.drop_score,
                 show_log=False,
             )
-        except ImportError:
-            self._ocr_engine = None
+            return self._ocr_engine
+        except ImportError as e:
+            self._init_failed = True
+            self._init_error = f"PaddleOCR not installed: {e}"
+        except Exception as e:
+            self._init_failed = True
+            self._init_error = str(e)
 
-        return self._ocr_engine
+        if raise_on_missing or self.strict:
+            raise OCREngineNotFoundError(
+                f"PaddleOCR engine is not available: {self._init_error}\n"
+                f"Please install PaddleOCR with: pip install paddleocr paddlepaddle"
+            )
+        return None
 
     def detect(
         self, image: np.ndarray
     ) -> List[Dict[str, Any]]:
         engine = self._get_engine()
         if engine is None:
-            return self._fallback_detect(image)
+            return []
 
         result = engine.ocr(image, det=True, rec=False)
         if result is None or len(result) == 0:
@@ -67,9 +93,9 @@ class TextDetector:
     def detect_with_text(
         self, image: np.ndarray
     ) -> List[Dict[str, Any]]:
-        engine = self._get_engine()
+        engine = self._get_engine(raise_on_missing=True)
         if engine is None:
-            return self._fallback_detect_with_text(image)
+            return []
 
         result = engine.ocr(image, det=True, rec=True)
         if result is None or len(result) == 0:
@@ -94,24 +120,14 @@ class TextDetector:
             )
         return items
 
-    def _fallback_detect(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        h, w = image.shape[:2]
-        return [
-            {
-                "bbox": [0, 0, w, h],
-                "polygon": [[0, 0], [w, 0], [w, h], [0, h]],
-            }
-        ]
+    def is_available(self) -> bool:
+        try:
+            self._get_engine(raise_on_missing=True)
+            return True
+        except OCREngineNotFoundError:
+            return False
 
-    def _fallback_detect_with_text(
-        self, image: np.ndarray
-    ) -> List[Dict[str, Any]]:
-        h, w = image.shape[:2]
-        return [
-            {
-                "bbox": [0, 0, w, h],
-                "polygon": [[0, 0], [w, 0], [w, h], [0, h]],
-                "text": "",
-                "confidence": 0.0,
-            }
-        ]
+    def get_error_message(self) -> Optional[str]:
+        if not self._init_failed:
+            return None
+        return self._init_error

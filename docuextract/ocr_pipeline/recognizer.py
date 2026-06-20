@@ -3,17 +3,29 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from docuextract.config import OCRConfig
+from docuextract.ocr_pipeline.detector import OCREngineNotFoundError
 
 
 class TextRecognizer:
 
-    def __init__(self, config: Optional[OCRConfig] = None):
+    def __init__(self, config: Optional[OCRConfig] = None, strict: bool = True):
         self.config = config or OCRConfig()
         self._ocr_engine = None
+        self._init_failed = False
+        self._init_error: Optional[str] = None
+        self.strict = strict
 
-    def _get_engine(self) -> Any:
+    def _get_engine(self, raise_on_missing: bool = False) -> Any:
         if self._ocr_engine is not None:
             return self._ocr_engine
+
+        if self._init_failed:
+            if raise_on_missing or self.strict:
+                raise OCREngineNotFoundError(
+                    f"PaddleOCR engine initialization failed: {self._init_error}\n"
+                    f"Please install PaddleOCR with: pip install paddleocr paddlepaddle"
+                )
+            return None
 
         try:
             from paddleocr import PaddleOCR
@@ -28,17 +40,27 @@ class TextRecognizer:
                 drop_score=self.config.drop_score,
                 show_log=False,
             )
-        except ImportError:
-            self._ocr_engine = None
+            return self._ocr_engine
+        except ImportError as e:
+            self._init_failed = True
+            self._init_error = f"PaddleOCR not installed: {e}"
+        except Exception as e:
+            self._init_failed = True
+            self._init_error = str(e)
 
-        return self._ocr_engine
+        if raise_on_missing or self.strict:
+            raise OCREngineNotFoundError(
+                f"PaddleOCR engine is not available: {self._init_error}\n"
+                f"Please install PaddleOCR with: pip install paddleocr paddlepaddle"
+            )
+        return None
 
     def recognize(
         self, image: np.ndarray
     ) -> List[Dict[str, Any]]:
-        engine = self._get_engine()
+        engine = self._get_engine(raise_on_missing=True)
         if engine is None:
-            return self._fallback_recognize(image)
+            return []
 
         result = engine.ocr(image, det=True, rec=True)
         if result is None or len(result) == 0:
@@ -65,6 +87,10 @@ class TextRecognizer:
     def recognize_crop(
         self, image: np.ndarray, bbox: List[int]
     ) -> Tuple[str, float]:
+        engine = self._get_engine(raise_on_missing=True)
+        if engine is None:
+            return "", 0.0
+
         x_min, y_min, x_max, y_max = bbox
         h, w = image.shape[:2]
         x_min = max(0, x_min)
@@ -77,10 +103,6 @@ class TextRecognizer:
 
         crop = image[y_min:y_max, x_min:x_max]
 
-        engine = self._get_engine()
-        if engine is None:
-            return self._fallback_recognize_crop(crop)
-
         result = engine.ocr(crop, det=False, rec=True)
         if result is None or len(result) == 0 or len(result[0]) == 0:
             return "", 0.0
@@ -89,15 +111,14 @@ class TextRecognizer:
         confidence = result[0][0][1]
         return text, confidence
 
-    def _fallback_recognize(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        h, w = image.shape[:2]
-        return [
-            {
-                "text": "",
-                "confidence": 0.0,
-                "bbox": [0, 0, w, h],
-            }
-        ]
+    def is_available(self) -> bool:
+        try:
+            self._get_engine(raise_on_missing=True)
+            return True
+        except OCREngineNotFoundError:
+            return False
 
-    def _fallback_recognize_crop(self, crop: np.ndarray) -> Tuple[str, float]:
-        return "", 0.0
+    def get_error_message(self) -> Optional[str]:
+        if not self._init_failed:
+            return None
+        return self._init_error

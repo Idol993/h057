@@ -13,9 +13,15 @@ from rich.table import Table
 from rich.text import Text
 
 from docuextract.config import AppConfig, get_config
-from docuextract.classification.doc_classifier import DocumentClassifier
-from docuextract.classification.preprocessor import preprocess_single
-from docuextract.ocr_pipeline.detector import TextDetector
+from docuextract.classification.doc_classifier import (
+    DocumentClassifier,
+    ClassifierModelNotFoundError,
+    ClassifierModelLoadError,
+)
+from docuextract.ocr_pipeline.detector import (
+    TextDetector,
+    OCREngineNotFoundError,
+)
 from docuextract.ocr_pipeline.layout_parser import LayoutParser
 from docuextract.extraction.field_extractor import FieldExtractor
 from docuextract.extraction.template_matcher import TemplateMatcher
@@ -26,6 +32,11 @@ from docuextract.reporting.csv_exporter import CSVExporter
 console = Console()
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".pdf"}
+
+
+class DocumentLoadError(RuntimeError):
+    """Failed to load document image or PDF."""
+    pass
 
 
 def _collect_files(input_path: Path) -> List[Path]:
@@ -44,24 +55,61 @@ def _collect_files(input_path: Path) -> List[Path]:
     return files
 
 
-def _load_image(image_path: Path) -> Optional[np.ndarray]:
+def _load_image(image_path: Path) -> np.ndarray:
+    """Load an image file (including PDF first page) as numpy array.
+
+    Raises DocumentLoadError on failure.
+    """
     try:
         if image_path.suffix.lower() == ".pdf":
             try:
                 from pdf2image import convert_from_path
 
                 pages = convert_from_path(str(image_path), first_page=1, last_page=1)
-                if pages:
-                    return np.array(pages[0])
-            except ImportError:
-                console.print("[yellow]pdf2image not installed, skipping PDF[/yellow]")
-                return None
+                if not pages:
+                    raise DocumentLoadError(
+                        f"PDF file has no pages: {image_path}"
+                    )
+                return np.array(pages[0])
+            except ImportError as e:
+                raise DocumentLoadError(
+                    f"pdf2image is required for PDF support. "
+                    f"Install with: pip install pdf2image. Error: {e}"
+                ) from e
+            except Exception as e:
+                raise DocumentLoadError(
+                    f"Failed to convert PDF to image: {e}"
+                ) from e
 
         img = Image.open(image_path).convert("RGB")
         return np.array(img)
+    except DocumentLoadError:
+        raise
     except Exception as e:
-        console.print(f"[red]Failed to load {image_path}: {e}[/red]")
-        return None
+        raise DocumentLoadError(f"Failed to load image {image_path}: {e}") from e
+
+
+def _build_error_report(
+    file_path: Path,
+    error_type: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    return {
+        "file": str(file_path),
+        "type": "unknown",
+        "classification_confidence": 0.0,
+        "fields": {},
+        "validation": {},
+        "error": {
+            "type": error_type,
+            "message": error_message,
+        },
+        "success": False,
+    }
+
+
+def _is_error_report(report: Dict[str, Any]) -> bool:
+    return report.get("success") is False or "error" in report
 
 
 def _process_single_file(
@@ -72,42 +120,62 @@ def _process_single_file(
     extractor: Optional[FieldExtractor] = None,
     validator: Optional[Validator] = None,
 ) -> Dict[str, Any]:
-    image = _load_image(image_path)
-    if image is None:
-        return {
-            "file": str(image_path),
-            "type": "unknown",
-            "classification_confidence": 0.0,
-            "fields": {},
-            "validation": {},
-            "error": "Failed to load image",
-        }
+    try:
+        image = _load_image(image_path)
+    except DocumentLoadError as e:
+        return _build_error_report(image_path, "load_error", str(e))
 
-    if classifier is None:
-        classifier = DocumentClassifier(config.classification)
-        classifier.load_model()
+    try:
+        if classifier is None:
+            classifier = DocumentClassifier(config.classification)
+            classifier.load_model()
+    except (ClassifierModelNotFoundError, ClassifierModelLoadError) as e:
+        return _build_error_report(image_path, "classifier_error", str(e))
 
-    if detector is None:
-        detector = TextDetector(config.ocr)
-
-    if extractor is None:
-        extractor = FieldExtractor(
-            config.extraction,
-            TemplateMatcher(config.extraction),
-            LayoutParser(),
+    try:
+        doc_type, class_conf, _ = classifier.predict_from_array(image)
+    except Exception as e:
+        return _build_error_report(
+            image_path, "classification_error",
+            f"Classification failed: {e}"
         )
 
-    if validator is None:
-        validator = Validator(config.validation)
+    try:
+        if detector is None:
+            detector = TextDetector(config.ocr, strict=True)
+        ocr_items = detector.detect_with_text(image)
+    except OCREngineNotFoundError as e:
+        return _build_error_report(image_path, "ocr_unavailable", str(e))
+    except Exception as e:
+        return _build_error_report(
+            image_path, "ocr_error",
+            f"OCR processing failed: {e}"
+        )
 
-    doc_type, class_conf, _ = classifier.predict(image_path)
+    try:
+        if extractor is None:
+            extractor = FieldExtractor(
+                config.extraction,
+                TemplateMatcher(config.extraction),
+                LayoutParser(),
+            )
+        fields = extractor.extract(doc_type, ocr_items, image.shape)
+    except Exception as e:
+        return _build_error_report(
+            image_path, "extraction_error",
+            f"Field extraction failed: {e}"
+        )
 
-    ocr_items = detector.detect_with_text(image)
-
-    fields = extractor.extract(doc_type, ocr_items, image.shape)
-
-    rules = extractor.template_matcher.get_validation_rules(doc_type)
-    validation = validator.validate(doc_type, fields, rules)
+    try:
+        if validator is None:
+            validator = Validator(config.validation)
+        rules = extractor.template_matcher.get_validation_rules(doc_type)
+        validation = validator.validate(doc_type, fields, rules)
+    except Exception as e:
+        return _build_error_report(
+            image_path, "validation_error",
+            f"Validation failed: {e}"
+        )
 
     return {
         "file": str(image_path),
@@ -115,6 +183,7 @@ def _process_single_file(
         "classification_confidence": class_conf,
         "fields": fields,
         "validation": validation,
+        "success": True,
     }
 
 
@@ -132,6 +201,14 @@ def _confidence_style(confidence: float) -> str:
 
 
 def _print_result_table(report: Dict[str, Any]) -> None:
+    if _is_error_report(report):
+        err = report.get("error", {})
+        console.print(f"[bold red]Processing failed:[/bold red] {Path(report['file']).name}")
+        console.print(f"  Error type: {err.get('type', 'unknown')}")
+        console.print(f"  Message: {err.get('message', '')}")
+        console.print()
+        return
+
     table = Table(title=f"Extraction Result: {Path(report['file']).name}")
     table.add_column("Field", style="cyan")
     table.add_column("Value")
@@ -195,25 +272,70 @@ def cli():
 @click.option("--format", "fmt", type=click.Choice(["json", "csv", "both"]), default="json", help="Output format")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed OCR results")
 def predict(input_file: Path, output: Optional[Path], fmt: str, verbose: bool):
-    """Extract information from a single document image."""
+    """Extract information from a single document image or PDF."""
     config = get_config()
 
     console.print(f"[bold blue]Processing:[/bold blue] {input_file}")
 
-    with console.status("Classifying document type..."):
-        classifier = DocumentClassifier(config.classification)
-        classifier.load_model()
-        doc_type, class_conf, class_probs = classifier.predict(input_file)
+    try:
+        image = _load_image(input_file)
+    except DocumentLoadError as e:
+        console.print(f"[bold red]Failed to load document:[/bold red] {e}")
+        sys.exit(1)
 
-    console.print(f"[bold]Document Type:[/bold] {doc_type} (confidence: {_confidence_style(class_conf)}{class_conf:.4f}/{_confidence_style(class_conf)})")
+    console.print(f"Image size: {image.shape[1]}x{image.shape[0]}")
+
+    with console.status("Loading classification model..."):
+        try:
+            classifier = DocumentClassifier(config.classification)
+            classifier.load_model()
+        except ClassifierModelNotFoundError as e:
+            console.print(f"[bold red]Classification model not found:[/bold red]")
+            console.print(str(e))
+            sys.exit(1)
+        except ClassifierModelLoadError as e:
+            console.print(f"[bold red]Failed to load classification model:[/bold red]")
+            console.print(str(e))
+            sys.exit(1)
+
+    with console.status("Classifying document type..."):
+        try:
+            doc_type, class_conf, class_probs = classifier.predict_from_array(image)
+        except Exception as e:
+            console.print(f"[bold red]Classification failed:[/bold red] {e}")
+            sys.exit(1)
+
+    conf_style = _confidence_style(class_conf)
+    console.print(
+        f"[bold]Document Type:[/bold] {doc_type} "
+        f"(confidence: [{conf_style}]{class_conf:.4f}[/{conf_style}])"
+    )
+
+    if verbose:
+        prob_table = Table(title="Classification Probabilities")
+        prob_table.add_column("Class", style="cyan")
+        prob_table.add_column("Probability", justify="right")
+        for cls_name, prob in class_probs.items():
+            pct = f"{prob * 100:.2f}%"
+            pct_style = _confidence_style(prob)
+            prob_table.add_row(cls_name, f"[{pct_style}]{pct}[/{pct_style}]")
+        console.print(prob_table)
+
+    with console.status("Initializing OCR engine..."):
+        try:
+            detector = TextDetector(config.ocr, strict=True)
+            _ = detector.is_available()
+        except OCREngineNotFoundError as e:
+            console.print(f"[bold red]OCR engine is not available:[/bold red]")
+            console.print(str(e))
+            sys.exit(1)
 
     with console.status("Running OCR..."):
-        detector = TextDetector(config.ocr)
-        image = _load_image(input_file)
-        if image is None:
-            console.print("[red]Failed to load image[/red]")
+        try:
+            ocr_items = detector.detect_with_text(image)
+        except Exception as e:
+            console.print(f"[bold red]OCR processing failed:[/bold red] {e}")
             sys.exit(1)
-        ocr_items = detector.detect_with_text(image)
 
     console.print(f"[bold]OCR blocks detected:[/bold] {len(ocr_items)}")
 
@@ -239,7 +361,11 @@ def predict(input_file: Path, output: Optional[Path], fmt: str, verbose: bool):
         layout_parser = LayoutParser()
         template_matcher = TemplateMatcher(config.extraction)
         extractor = FieldExtractor(config.extraction, template_matcher, layout_parser)
-        fields = extractor.extract(doc_type, ocr_items, image.shape)
+        try:
+            fields = extractor.extract(doc_type, ocr_items, image.shape)
+        except Exception as e:
+            console.print(f"[bold red]Field extraction failed:[/bold red] {e}")
+            sys.exit(1)
 
     with console.status("Validating..."):
         rules = template_matcher.get_validation_rules(doc_type)
@@ -255,6 +381,7 @@ def predict(input_file: Path, output: Optional[Path], fmt: str, verbose: bool):
         validation=validation,
         ocr_items=ocr_items if verbose else None,
     )
+    report["success"] = True
 
     _print_result_table(report)
 
@@ -273,18 +400,18 @@ def predict(input_file: Path, output: Optional[Path], fmt: str, verbose: bool):
 
 
 @cli.command()
-@click.option("--input", "-i", "input_dir", type=click.Path(exists=True, path_type=Path), required=True, help="Input directory with document images")
+@click.option("--input", "-i", "input_dir", type=click.Path(exists=True, path_type=Path), required=True, help="Input directory with document images/PDFs")
 @click.option("--output", "-o", "output_path", type=click.Path(path_type=Path), default=None, help="Output file path")
 @click.option("--format", "fmt", type=click.Choice(["json", "csv", "both"]), default="json", help="Output format")
 @click.option("--workers", "-w", type=int, default=1, help="Number of parallel workers")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed results")
 def batch(input_dir: Path, output_path: Optional[Path], fmt: str, workers: int, verbose: bool):
-    """Batch process a directory of document images."""
+    """Batch process a directory of document images and PDFs."""
     config = get_config()
 
     files = _collect_files(input_dir)
     if not files:
-        console.print("[red]No supported image files found[/red]")
+        console.print("[red]No supported image/PDF files found[/red]")
         sys.exit(1)
 
     console.print(f"[bold blue]Found {len(files)} files to process[/bold blue]")
@@ -312,20 +439,38 @@ def batch(input_dir: Path, output_path: Optional[Path], fmt: str, workers: int, 
                     try:
                         report = future.result()
                         reports.append(report)
-                        progress.update(task, advance=1, description=f"Processed {Path(str(file_path)).name}")
+                        status_icon = "\u2713" if not _is_error_report(report) else "\u2717"
+                        progress.update(
+                            task, advance=1,
+                            description=f"{status_icon} {Path(str(file_path)).name}"
+                        )
                     except Exception as e:
-                        reports.append({
-                            "file": str(file_path),
-                            "type": "unknown",
-                            "classification_confidence": 0.0,
-                            "fields": {},
-                            "validation": {"error": {"pass": False, "reason": str(e)}},
-                        })
+                        reports.append(_build_error_report(
+                            file_path, "unexpected_error", str(e)
+                        ))
                         progress.update(task, advance=1)
     else:
-        classifier = DocumentClassifier(config.classification)
-        classifier.load_model()
-        detector = TextDetector(config.ocr)
+        try:
+            classifier = DocumentClassifier(config.classification)
+            classifier.load_model()
+        except (ClassifierModelNotFoundError, ClassifierModelLoadError) as e:
+            console.print(f"[bold red]Failed to load classification model:[/bold red]")
+            console.print(str(e))
+            console.print()
+            console.print("[yellow]Tip: Place the pre-trained model at the path shown above,[/yellow]")
+            console.print("[yellow]or install pytorch + torchvision if not present.[/yellow]")
+            sys.exit(1)
+
+        try:
+            detector = TextDetector(config.ocr, strict=True)
+            _ = detector.is_available()
+        except OCREngineNotFoundError as e:
+            console.print(f"[bold yellow]OCR engine not available:[/bold yellow]")
+            console.print(str(e))
+            console.print()
+            console.print("[yellow]Batch processing will continue but all files will fail at OCR stage.[/yellow]")
+            console.print("[yellow]Install PaddleOCR for full functionality: pip install paddleocr paddlepaddle[/yellow]")
+
         extractor = FieldExtractor(
             config.extraction,
             TemplateMatcher(config.extraction),
@@ -351,29 +496,71 @@ def batch(input_dir: Path, output_path: Optional[Path], fmt: str, workers: int, 
                     )
                     reports.append(report)
                 except Exception as e:
-                    reports.append({
-                        "file": str(file_path),
-                        "type": "unknown",
-                        "classification_confidence": 0.0,
-                        "fields": {},
-                        "validation": {"error": {"pass": False, "reason": str(e)}},
-                    })
+                    reports.append(_build_error_report(
+                        file_path, "unexpected_error", str(e)
+                    ))
                 progress.update(task, advance=1)
 
     reporter = JSONReporter(config.output)
-    batch_report = reporter.generate_batch_report(reports)
+
+    success_reports = [r for r in reports if not _is_error_report(r)]
+    error_reports = [r for r in reports if _is_error_report(r)]
 
     console.print()
-    summary = batch_report["summary"]
     console.print(f"[bold]Batch Processing Summary[/bold]")
-    console.print(f"  Total files: {summary['total_files']}")
-    console.print(f"  [green]Validation passed: {summary['validation_passed']}[/green]")
-    console.print(f"  [red]Validation failed: {summary['validation_failed']}[/red]")
-    console.print(f"  Type distribution: {summary['type_distribution']}")
+    console.print(f"  Total files: {len(reports)}")
+    console.print(f"  [green]Successfully processed: {len(success_reports)}[/green]")
+    console.print(f"  [red]Failed: {len(error_reports)}[/red]")
+
+    if error_reports:
+        console.print()
+        err_table = Table(title="Failed Files")
+        err_table.add_column("File", style="cyan")
+        err_table.add_column("Error Type")
+        err_table.add_column("Message")
+        for report in error_reports:
+            err = report.get("error", {})
+            err_table.add_row(
+                Path(report["file"]).name,
+                err.get("type", "unknown"),
+                err.get("message", "")[:80],
+            )
+        console.print(err_table)
+
+    if success_reports:
+        type_counts: Dict[str, int] = {}
+        for r in success_reports:
+            t = r.get("type", "unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        console.print(f"  Type distribution: {type_counts}")
+
+        passed = sum(
+            1
+            for r in success_reports
+            if all(v.get("pass", False) for v in r.get("validation", {}).values())
+        )
+        console.print(f"  [green]Validation passed: {passed}[/green]")
+        console.print(f"  [red]Validation failed: {len(success_reports) - passed}[/red]")
 
     if verbose:
         for report in reports:
             _print_result_table(report)
+
+    all_reports = []
+    for r in reports:
+        if _is_error_report(r):
+            all_reports.append(r)
+        else:
+            all_reports.append(r)
+
+    batch_report: Dict[str, Any] = {
+        "summary": {
+            "total_files": len(reports),
+            "success_count": len(success_reports),
+            "failed_count": len(error_reports),
+        },
+        "results": all_reports,
+    }
 
     timestamp = datetime.now().strftime(config.output.timestamp_format)
 
@@ -382,40 +569,64 @@ def batch(input_dir: Path, output_path: Optional[Path], fmt: str, workers: int, 
         saved = reporter.save_report(batch_report, json_path)
         console.print(f"[green]JSON report saved to:[/green] {saved}")
 
-    if fmt in ("csv", "both"):
+    if fmt in ("csv", "both") and success_reports:
         csv_exporter = CSVExporter(config.output)
         if output_path:
             csv_path = output_path.with_suffix(".csv")
         else:
             csv_path = Path(f"extraction_{timestamp}.csv")
-        saved = csv_exporter.export(reports, csv_path)
-        console.print(f"[green]CSV report saved to:[/green] {saved}")
+        saved = csv_exporter.export(success_reports, csv_path)
+        console.print(f"[green]CSV report saved to:[/green] {saved} (success records only)")
+
+    if error_reports and len(error_reports) > 0:
+        console.print(f"[yellow]{len(error_reports)} file(s) failed. See JSON report for details.[/yellow]")
 
 
 @cli.command()
-@click.option("--input", "-i", "input_file", type=click.Path(exists=True, path_type=Path), required=True, help="Input document image to validate")
+@click.option("--input", "-i", "input_file", type=click.Path(exists=True, path_type=Path), required=True, help="Input document image/PDF to validate")
 @click.option("--type", "doc_type", type=click.Choice(["invoice", "id_card", "bank_card", "receipt"]), default=None, help="Override document type (skip classification)")
 def validate(input_file: Path, doc_type: Optional[str]):
-    """Validate extracted fields from a document image."""
+    """Validate extracted fields from a document image or PDF."""
     config = get_config()
 
     console.print(f"[bold blue]Validating:[/bold blue] {input_file}")
 
+    try:
+        image = _load_image(input_file)
+    except DocumentLoadError as e:
+        console.print(f"[bold red]Failed to load document:[/bold red] {e}")
+        sys.exit(1)
+
     if doc_type is None:
+        with console.status("Loading classification model..."):
+            try:
+                classifier = DocumentClassifier(config.classification)
+                classifier.load_model()
+            except ClassifierModelNotFoundError as e:
+                console.print(f"[bold red]Classification model not found:[/bold red]")
+                console.print(str(e))
+                sys.exit(1)
+            except ClassifierModelLoadError as e:
+                console.print(f"[bold red]Failed to load classification model:[/bold red]")
+                console.print(str(e))
+                sys.exit(1)
+
         with console.status("Classifying document type..."):
-            classifier = DocumentClassifier(config.classification)
-            classifier.load_model()
-            doc_type, class_conf, _ = classifier.predict(input_file)
+            doc_type, class_conf, _ = classifier.predict_from_array(image)
         console.print(f"[bold]Document Type:[/bold] {doc_type} (confidence: {class_conf:.4f})")
     else:
         console.print(f"[bold]Document Type:[/bold] {doc_type} (manually set)")
 
-    with console.status("Running OCR and extraction..."):
-        detector = TextDetector(config.ocr)
-        image = _load_image(input_file)
-        if image is None:
-            console.print("[red]Failed to load image[/red]")
+    with console.status("Initializing OCR engine..."):
+        try:
+            detector = TextDetector(config.ocr, strict=True)
+            _ = detector.is_available()
+        except OCREngineNotFoundError as e:
+            console.print(f"[bold red]OCR engine is not available:[/bold red]")
+            console.print(str(e))
             sys.exit(1)
+
+    with console.status("Running OCR and extraction..."):
         ocr_items = detector.detect_with_text(image)
 
         layout_parser = LayoutParser()
@@ -431,8 +642,10 @@ def validate(input_file: Path, doc_type: Optional[str]):
     _print_result_table({
         "file": str(input_file),
         "type": doc_type,
+        "classification_confidence": 0.0 if doc_type else 0,
         "fields": fields,
         "validation": validation,
+        "success": True,
     })
 
     all_pass = all(v.get("pass", False) for v in validation.values())

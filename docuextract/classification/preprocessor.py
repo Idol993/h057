@@ -70,6 +70,23 @@ def preprocess_single(
     return transform(img).unsqueeze(0)
 
 
+def preprocess_array(
+    image_array: np.ndarray,
+    config: Optional[ClassificationConfig] = None,
+) -> Any:
+    torch, _Dataset, _DataLoader, transforms = _get_torch_modules()
+    cfg = config or ClassificationConfig()
+    transform = transforms.Compose(
+        [
+            transforms.Resize((cfg.input_size, cfg.input_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=cfg.mean, std=cfg.std),
+        ]
+    )
+    img = Image.fromarray(image_array).convert("RGB")
+    return transform(img).unsqueeze(0)
+
+
 def create_dataloader(
     image_paths: List[Path],
     config: Optional[ClassificationConfig] = None,
